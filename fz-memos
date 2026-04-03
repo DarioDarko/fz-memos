@@ -1,0 +1,376 @@
+#!/usr/bin/env bash
+
+#----------------#
+#----FZ-MEMOS----#
+#----------------#
+
+for tool in bat curl fzf glow gum jq
+do
+	command -v "$tool" &> /dev/null \
+	|| { printf "%s is not installed\n" "$tool"; exit 1; }
+done
+
+SELF=$(realpath "${BASH_SOURCE[0]}")
+SELF="\"${SELF}\""
+
+MEMOS_URL="${MEMOS_URL%/}"
+
+tmp_socket="/tmp/.fz-memos.sock"
+tmp_memo="/tmp/.memo.md"
+tmp_memo_tags="/tmp/.memo-tags"
+
+export tmp_memo_tags
+
+load()
+{
+	local url
+
+	url="${MEMOS_URL}/api/v1/memos"
+	url+="?pageSize=${MEMOS_PAGE_SIZE:-50}"
+
+	MEMOS_ORDER="${MEMOS_ORDER// /%20}"
+	url+="&orderBy=${MEMOS_ORDER:-update_time%20desc}"
+
+	if [[ $1 == "--filter" ]]
+	then
+		local filter operator
+		local -a words
+
+		case "${MEMOS_FILTER_OPERATOR,,}" in
+			"or") operator="%7C%7C";;
+			*) operator="%26%26";;
+		esac
+
+		IFS=' ' read -ra words <<< "$2"
+
+		for word in "${words[@]}"
+		do
+			filter+="content.contains(\"${word}\")%20${operator}%20"
+		done
+
+		url+="&filter=${filter%\%20"${operator}"\%20}"
+	fi
+
+	local italic grey reset
+	local url response token memos i name update_time tags content random random_last random_color tags_string title
+
+	italic=$'\033[3m'
+	grey=$'\033[90m'
+	reset=$'\033[0m'
+
+	while true
+	do
+		url="${url%&pageToken=*}"
+
+		[[ -n "$token" ]] \
+		&& url+="&pageToken=${token}"
+		
+		response=$(
+			curl -s -X GET "$url" \
+			-H "Authorization: Bearer $MEMOS_API_KEY"
+		)
+
+		token=$(jq -r 'try .nextPageToken // empty' <<< "$response")
+		memos=$(jq '.memos' <<< "$response")
+
+		i=0
+
+		while true
+		do
+			unset random random_last random_color tags_string title
+
+			name=$(jq -r "try .[${i}].name // empty" <<< "$memos")
+			[[ -z "$name" ]] && break
+
+			update_time=$(jq -r ".[${i}].updateTime" <<< "$memos")
+			update_time=$(date -d "$update_time" +"%Y-%m-%d %H:%M")
+			update_time="${grey}${update_time}${reset}"
+
+			tags=$(jq -r ".[${i}].tags[]" <<< "$memos")
+			content=$(jq -r ".[${i}].content" <<< "$memos")
+
+			while read -r tag
+			do
+				[[ ! -f "${tmp_memo_tags}/${tag}" && $tag =~ ^[a-zA-Z0-9]+$ ]] \
+				&& touch "${tmp_memo_tags}/${tag}"
+
+				while [[ -z "$random" || $random == "$random_last" ]]
+				do
+					random=$(( RANDOM % 6 + 1 ))
+				done
+
+				random_last="$random"
+				random_color=$'\033[3'"$random"'m'
+				tags_string+="${random_color}#${tag}${reset} "
+			done <<< "$tags"
+
+			tags_string="${tags_string% }"
+
+			while read -r line
+			do
+				[[ $line == "# "* ]] \
+				&& { title="${line#\# }"; break; }
+			done <<< "$content"
+
+			title="${title:-unnamed}"
+
+			if (( ${#title} == 20 ))
+			then
+				:
+			elif (( ${#title} > 20 ))
+			then
+				title="${title:0:18}.."
+			else
+				while (( ${#title} < 20 ))
+				do
+					title="$title "
+				done
+			fi
+
+			title="${italic}${title}${reset}"
+
+			printf "%s\t%s\t%s %s\n" \
+			"$name" "$update_time" "$title" "$tags_string"
+
+			((i++))
+		done
+
+		[[ -z "$token" ]] && break
+	done
+}
+
+get_content()
+{
+	curl -s -X GET "${MEMOS_URL}/api/v1/${1}" \
+	-H "Authorization: Bearer $MEMOS_API_KEY" \
+	| jq -r '.content'
+}
+
+sort_tags()
+{
+	local content tags_sorted content_new
+	local -a tags_array
+	
+	content="$1"
+
+	while read -r line
+	do
+		if [[ $line =~ ^#[a-zA-Z0-9]+$ ]]
+		then
+			tags_array+=("$line")
+			sed -i "1d" "$tmp_memo"
+			continue
+		fi
+
+		break
+	done <<< "$content"
+
+	tags_sorted=$(
+		for tag in "${tags_array[@]}"
+		do
+			printf "%s\n" "$tag"
+		done | sort
+	)
+
+	content_new="$tags_sorted"$'\n'"$(< "$tmp_memo")"
+	printf "%s" "$content_new"
+}
+
+export -f load sort_tags
+
+if [[ $1 == "--stdout" ]]
+then
+	shift
+	stdout=true
+else
+	stdout=false
+fi
+
+case "$1" in
+"preview")
+	bat \
+	--plain \
+	--color "always" \
+	--language "markdown" \
+	<(get_content "$2")
+
+	exit 0
+;;
+"view")
+	content=$(get_content "$2")
+
+	while IFS= read -r line
+	do
+		if ! ${tags_read:-false} && [[ $line =~ ^#[a-zA-Z0-9_]+$ ]]
+		then
+			continue
+		else
+			printf "%s\n" "$line"
+			tags_read=true
+		fi
+	done <<< "$content" | glow
+
+	exit 0
+;;
+"edit")
+	content_old=$(get_content "$2")
+	printf "%s" "$content_old" > "$tmp_memo"
+
+	"$EDITOR" -- "$tmp_memo"
+
+	content=$(< "$tmp_memo")
+
+	[[ -z "$content" || $content == "$content_old" ]] \
+	&& exit 0
+
+	content=$(sort_tags "$content")
+	update_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+	payload=$(
+		jq -n --arg content "$content" --arg update_time "$update_time" \
+		'{ content: $content, updateTime: $update_time }'
+	)
+
+	curl -s -X PATCH "${MEMOS_URL}/api/v1/${2}" \
+	-H "Authorization: Bearer $MEMOS_API_KEY" \
+	-H "Content-Type: application/json" \
+	-d "$payload" &> /dev/null
+
+	curl -s --unix-socket "$tmp_socket" http -d 'reload(bash -c "load")' &> /dev/null
+
+	exit 0
+;;
+"new")
+	[[ -f "$tmp_memo" ]] \
+	&& rm -f "$tmp_memo"
+
+	tags=$(
+		for tag in "$tmp_memo_tags"/*
+		do
+			tag="${tag#"${tmp_memo_tags}"/}"
+			printf "%s\n" "$tag"
+		done \
+		| gum filter \
+		--no-limit \
+		--no-show-help \
+		--placeholder "set tags" \
+		--header "new memo"$'\n' \
+		--header.foreground 4
+	) || exit 0
+
+	while read -r tag
+	do
+		printf "#%s\n" "$tag" >> "$tmp_memo"
+	done <<< "$tags"
+
+	printf "\n# " >> "$tmp_memo"
+
+	if [[ -z "$MEMOS_EDITOR_ARGS" ]]
+	then
+		if [[ $EDITOR == "nvim" ]]
+		then
+			nvim '+startinsert' '+normal! G$' -- "$tmp_memo"
+		else
+			"$EDITOR" -- "$tmp_memo"
+		fi
+	else
+		IFS='|' read -ra EDITOR_ARGS <<< "$MEMOS_EDITOR_ARGS"
+		"$EDITOR" "${EDITOR_ARGS[@]}" -- "$tmp_memo"
+	fi
+
+	content=$(< "$tmp_memo")
+
+	[[ -z "$content" ]] \
+	&& exit 0
+
+	content=$(sort_tags "$content")
+
+	payload=$(
+		jq -n --arg content "$content" \
+		'{ content: $content }'
+	)
+
+	curl -s -X POST "${MEMOS_URL}/api/v1/memos" \
+	-H "Authorization: Bearer $MEMOS_API_KEY" \
+	-H "Content-Type: application/json" \
+	-d "$payload" &> /dev/null
+
+	curl -s --unix-socket "$tmp_socket" http -d 'reload(bash -c "load")' &> /dev/null
+
+	exit 0
+;;
+"delete")
+	curl -s -X PATCH "${MEMOS_URL}/api/v1/${2}" \
+	-H "Authorization: Bearer $MEMOS_API_KEY" \
+	-d "{ \"state\": \"ARCHIVED\" }" &> /dev/null
+
+	curl -s --unix-socket "$tmp_socket" http -d 'reload(bash -c "load")' &> /dev/null
+
+	exit 0
+;;
+esac
+
+[[ -n "$1" ]] && exit 0
+mkdir "$tmp_memo_tags"
+
+cleanup()
+{
+	rm -f "$tmp_memo"
+	rm -rf "$tmp_memo_tags"
+}
+
+trap 'cleanup' EXIT SIGHUP SIGINT
+
+header+='  _____    ____    _____    ____   ______'$'\n'
+header+=' /     \ _/ __ \  /     \  /    \ /  ___/'$'\n'
+header+='|  Y Y  \\  ___/ |  Y Y  \(  ()  )\___ \ '$'\n'
+header+='|__|_|  / \_____>|__|_|  / \____/ _____/ '$'\n'
+header+='      \/               \/'
+
+fzf_args=(
+	--listen "$tmp_socket"
+	--ansi
+	--header-first
+	--header "$header"
+	--color "header:blue:bold"
+	--reverse
+	--delimiter $'\t'
+	--with-nth 3..
+	--preview "$SELF preview {1}"
+	--bind 'change:reload(bash -c "load --filter {q}")'
+	--bind 'start,ctrl-f:unbind(change)+reload(bash -c "load")+change-prompt(f> )+enable-search+clear-query'
+	--bind 'ctrl-g:rebind(change)+change-prompt(g> )+disable-search+clear-query'
+	--bind 'ctrl-d:execute-silent('"$SELF"' delete {1})'
+	--bind 'ctrl-i:change-with-nth(2..|3..)'
+)
+
+if [[ -n "$TMUX" ]]
+then
+	popup="tmux popup -e MEMOS_URL=\"${MEMOS_URL}\" "
+	popup+="-e MEMOS_API_KEY=\"${MEMOS_API_KEY}\" "
+	popup+="-e MEMOS_EDITOR_ARGS=\"${MEMOS_EDITOR_ARGS}\" "
+	popup+="-w 80% -h 80% -E -- $SELF"
+
+	fzf_args+=(
+		--bind 'enter:execute-silent('"$popup"' view {1} &)'
+		--bind 'ctrl-e:execute-silent('"$popup"' edit {1} &)'
+		--bind 'ctrl-n:execute-silent('"$popup"' new &)'
+	)
+else
+	fzf_args+=(
+		--bind 'enter:execute('"$SELF"' view {1})'
+		--bind 'ctrl-e:execute('"$SELF"' edit {1})'
+		--bind 'ctrl-n:execute('"$SELF"' new)'
+	)
+fi
+
+if $stdout
+then
+	export -f get_content
+
+	fzf_args+=(
+		--bind 'enter:become(bash -c "get_content {1}")'
+	)
+fi
+
+: | fzf "${fzf_args[@]}"
